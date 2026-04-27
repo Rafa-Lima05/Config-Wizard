@@ -1,0 +1,280 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+# ADMIN CHECK
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    [System.Windows.Forms.MessageBox]::Show("Run this script as Administrator.", "Kiosk Setup", "OK", "Error")
+    exit
+}
+
+# LOG SETUP
+
+$logDir = "C:\Path\To\Logging\Folder"
+if (-not (Test-Path $logDir)) {
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+}
+
+$logFile = Join-Path $logDir "setup_log.txt"
+"" | Out-File $logFile
+
+function Write-Log {
+    param($Level,$Message)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content $logFile "$ts $Level KioskSetup $Message"
+}
+
+# INPUT DIALOG (BLOCKING - SAFE)
+
+function Show-InputDialog {
+    param(
+        [string]$Title,
+        [string]$Label,
+        [string]$Default = "",
+        [scriptblock]$Validator
+    )
+
+    while ($true) {
+
+        $form = New-Object Windows.Forms.Form
+        $form.Text = $Title
+        $form.Size = New-Object Drawing.Size(420,160)
+        $form.StartPosition = "CenterScreen"
+        $form.TopMost = $true
+
+        $lbl = New-Object Windows.Forms.Label
+        $lbl.Text = $Label
+        $lbl.Location = New-Object Drawing.Point(10,10)
+        $lbl.Size = New-Object Drawing.Size(380,20)
+
+        $txt = New-Object Windows.Forms.TextBox
+        $txt.Location = New-Object Drawing.Point(10,40)
+        $txt.Size = New-Object Drawing.Size(380,20)
+        $txt.Text = $Default
+
+        $ok = New-Object Windows.Forms.Button
+        $ok.Text = "OK"
+        $ok.Location = New-Object Drawing.Point(10,75)
+        $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+        $form.Controls.AddRange(@($lbl,$txt,$ok))
+        $form.AcceptButton = $ok
+
+        if ($form.ShowDialog() -ne "OK") { continue }
+
+        $value = $txt.Text.Trim()
+
+        if ($Validator) {
+            $err = & $Validator $value
+            if ($err) {
+                [System.Windows.Forms.MessageBox]::Show($err,"Validation Error")
+                continue
+            }
+        }
+
+        return $value
+    }
+}
+
+# MAIN UI
+
+$form = New-Object Windows.Forms.Form
+$form.Text = "Kiosk Setup Wizard"
+$form.Size = New-Object Drawing.Size(620,240)
+$form.StartPosition = "CenterScreen"
+$form.TopMost = $true
+
+$status = New-Object Windows.Forms.Label
+$status.Text = "Starting..."
+$status.Location = New-Object Drawing.Point(10,20)
+$status.Size = New-Object Drawing.Size(580,20)
+$status.Font = New-Object Drawing.Font("Segoe UI",10,[Drawing.FontStyle]::Bold)
+
+$progress = New-Object Windows.Forms.ProgressBar
+$progress.Location = New-Object Drawing.Point(10,60)
+$progress.Size = New-Object Drawing.Size(580,25)
+$progress.Minimum = 0
+$progress.Maximum = 10
+$progress.Value = 0
+
+$form.Controls.Add($status)
+$form.Controls.Add($progress)
+
+# STATE
+
+$script:stepIndex = 0
+$script:appPath = $null
+$script:serverUrlSet = $false
+
+# STEPS
+
+$script:steps = @(
+    @{
+        Name = "Locate EXE"
+        Action = {
+            $base = "C:\Base\path\to\file"
+            if (-not (Test-Path $base)) { throw "Base folder not found." }
+
+            $exe = Get-ChildItem $base -Filter file.exe -Recurse |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+
+            if (-not $exe) { throw "file.exe not found." }
+
+            $script:appPath = $exe.FullName
+        }
+    }
+
+    @{
+        Name = "Update serverUrl"
+        Action = {
+
+            if ($script:serverUrlSet) { return }
+
+            $script:serverUrlSet = $true
+
+            $url = Show-InputDialog `
+                "Server URL" `
+                "Enter URL" `
+                "https://Server.Url.pt/" `
+                {
+                    param($v)
+                    if (-not $v) { return "Required." }
+                    if ($v -notmatch '^https?://') { return "Invalid URL." }
+                }
+
+            $config = Join-Path (Split-Path $script:appPath) "file.exe.config"
+            if (-not (Test-Path $config)) { throw "Config missing." }
+
+            [xml]$xml = Get-Content $config
+
+            $node = $xml.configuration.appSettings.add |
+                Where-Object { $_.key -eq "serverUrl" }
+
+            if ($node) {
+                $node.value = $url
+            }
+            else {
+                $new = $xml.CreateElement("add")
+                $new.SetAttribute("key","serverUrl")
+                $new.SetAttribute("value",$url)
+                $xml.configuration.appSettings.AppendChild($new) | Out-Null
+            }
+
+            $xml.Save($config)
+        }
+    }
+
+    @{
+        Name = "Power Settings"
+        Action = {
+            powercfg /change standby-timeout-ac 0 | Out-Null
+            powercfg /change standby-timeout-dc 0 | Out-Null
+        }
+    }
+
+    @{
+        Name = "Virtual Memory"
+        Action = {
+            $size = 1388
+            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+            Set-ItemProperty -Path $regPath -Name "PagingFiles" -Value @("C:\pagefile.sys $size $size")
+        }
+    }
+
+    @{
+        Name = "Clean Logs"
+        Action = {
+            Get-ChildItem $logDir -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-1) } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        }
+    }
+    @{
+        Name = "Archive Logs"
+        Action = {
+            $dest = "C:\Path\To\Logging\Folder\Archive\$(Get-Date -Format 'dd-MM-yyyy')"
+            if (-not (Test-Path $dest)) {
+                New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            }
+            Copy-Item $logFile $dest -Force
+        }
+    }
+
+    @{
+        Name = "Disable LockScreen"
+        Action = {
+            reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\Personalization" /v NoLockScreen /t REG_DWORD /d 1 /f | Out-Null
+        }
+    }
+
+    @{
+        Name = "Disable Edge Zoom"
+        Action = {
+            reg add "HKLM\SOFTWARE\Policies\Microsoft\Edge" /v PinchZoomEnabled /t REG_DWORD /d 0 /f | Out-Null
+        }
+    }
+
+    @{
+        Name = "Legacy Zoom"
+        Action = {
+            reg add "HKCU\Software\Test" /v ZoomDisabled /t REG_DWORD /d 1 /f | Out-Null
+        }
+    }
+
+    @{
+        Name = "Install NPD"
+        Action = {
+            $installer = "C:\Path\to\installer\file.exe"
+            if (Test-Path $installer) {
+                Start-Process $installer -ArgumentList "/S" -Wait
+            }
+        }
+    }
+
+    @{
+        Name = "Rename Computer"
+        Action = {
+            Rename-Computer -NewName "Name-PC" -Force
+        }
+    }
+)
+
+# RUN SEQUENTIALLY
+
+$form.Add_Shown({
+
+    foreach ($step in $script:steps) {
+
+        try {
+            $script:stepIndex++
+
+            $status.Text = "Step $script:stepIndex : $($step.Name)"
+            $progress.Value = $script:stepIndex
+
+            Write-Log INFO "START $($step.Name)"
+
+            & $step.Action
+
+            Write-Log INFO "OK $($step.Name)"
+        }
+        catch {
+            Write-Log ERROR $_.Exception.Message
+
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error")
+            $form.Close()
+            return
+        }
+    }
+
+    $status.Text = "Completed. Restarting..."
+    $progress.Value = $progress.Maximum
+
+    Start-Sleep 2
+    Restart-Computer -Force
+})
+
+# RUN UI
+
+[void]$form.ShowDialog()
